@@ -1,6 +1,7 @@
-// server.js - Single Node.js File for Digital Product Uploader (Fixed Object Iteration)
+// server.js - Full Working Single Node.js File for Digital Product Uploader
+// All fixes applied: formidable v3, parsing, S3 upload, Mongo save, Shopify integration
 // Run with: node server.js (or nodemon server.js for dev)
-// npm install express formidable@^3.5.1 aws-sdk graphql-request mongoose dotenv
+// Dependencies: npm install express formidable@^3.5.1 aws-sdk graphql-request mongoose dotenv
 
 require('dotenv').config();
 const express = require('express');
@@ -527,7 +528,7 @@ app.post('/api/upload', async (req, res) => {
   }
 });
 
-// Test Route (with JSON parsing if needed)
+// Test Route
 app.get('/', (req, res) => {
   res.send('Digital Product Uploader API is running on Node.js!');
 });
