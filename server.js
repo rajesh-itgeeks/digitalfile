@@ -1,5 +1,6 @@
 // server.js - Full Working Single Node.js File for Digital Product Uploader
 // All fixes applied: formidable v3, parsing, S3 upload, Mongo save, Shopify integration
+// Enhanced logging for debugging: productData, tags, no-file uploads
 // Run with: node server.js (or nodemon server.js for dev)
 // Dependencies: npm install express formidable@^3.5.1 aws-sdk graphql-request mongoose dotenv
 
@@ -121,12 +122,12 @@ async function parseFormData(req) {
 
     console.log('🔍 Parse result type for fields:', typeof rawFields);  // Debug
     console.log('🔍 Parse result type for files:', typeof rawFiles);  // Debug
-    console.log('🔍 Raw fields keys:', Object.keys(rawFields));  // Debug
-    console.log('🔍 Raw files keys:', Object.keys(rawFiles));  // Debug
+    console.log('🔍 Raw fields keys:', Object.keys(rawFields || {}));  // Debug
+    console.log('🔍 Raw files keys:', Object.keys(rawFiles || {}));  // Debug
 
     // Safety check: If undefined or empty, log and return empty
-    if (!rawFields || Object.keys(rawFields).length === 0 || !rawFiles || Object.keys(rawFiles).length === 0) {
-      console.warn('⚠️ No fields or files found in request. Ensure Content-Type: multipart/form-data');
+    if (!rawFields || Object.keys(rawFields).length === 0) {
+      console.warn('⚠️ No fields found in request. Ensure Content-Type: multipart/form-data and productData is appended.');
       return { fields: {}, files: {} };
     }
 
@@ -136,44 +137,52 @@ async function parseFormData(req) {
       fieldsObj[name] = Array.isArray(value) ? value : [value];
     }
 
-    // Handle files upload to S3 (rawFiles is plain object, values are arrays of file objects)
+    console.log('🔍 Parsed productData field:', getField(fieldsObj, 'productData') ? 'Present' : 'MISSING');  // Enhanced debug
+
+    // Handle files upload to S3 only if files exist (rawFiles is plain object, values are arrays of file objects)
     const filesObj = {};
     const uploadPromises = [];
 
-    for (const [name, fileArray] of Object.entries(rawFiles)) {
-      console.log(`📁 Processing file field: ${name}, files count: ${fileArray.length}`);  // Debug
-      fileArray.forEach((fileObj, index) => {
-        if (fileObj && fileObj.filepath) {
-          if (!fs.existsSync(fileObj.filepath)) {
-            console.error(`⚠️ Temp file not found: ${fileObj.filepath}`);
-            return;
-          }
+    if (rawFiles && Object.keys(rawFiles).length > 0) {
+      for (const [name, fileArray] of Object.entries(rawFiles)) {
+        console.log(`📁 Processing file field: ${name}, files count: ${fileArray.length}`);  // Debug
+        fileArray.forEach((fileObj, index) => {
+          if (fileObj && fileObj.filepath) {
+            if (!fs.existsSync(fileObj.filepath)) {
+              console.error(`⚠️ Temp file not found: ${fileObj.filepath}`);
+              return;
+            }
 
-          const uploadPromise = uploadFileStreamToS3(name, fileObj, fieldsObj);
-          uploadPromises.push(
-            uploadPromise.then(result => {
-              if (result) {
-                if (!filesObj[name]) filesObj[name] = [];
-                filesObj[name].push(result);
-              }
-            }).catch(err => {
-              console.error(`Error uploading file ${name}[${index}]:`, err);
-            })
-          );
-        }
-      });
+            const uploadPromise = uploadFileStreamToS3(name, fileObj, fieldsObj);
+            uploadPromises.push(
+              uploadPromise.then(result => {
+                if (result) {
+                  if (!filesObj[name]) filesObj[name] = [];
+                  filesObj[name].push(result);
+                }
+              }).catch(err => {
+                console.error(`Error uploading file ${name}[${index}]:`, err);
+              })
+            );
+          }
+        });
+      }
+
+      await Promise.all(uploadPromises);
+    } else {
+      console.log('ℹ️ No files in request - proceeding with product data only');
     }
 
-    await Promise.all(uploadPromises);
-
-    // Cleanup temp files
-    for (const [name, fileArray] of Object.entries(rawFiles)) {
-      fileArray.forEach(fileObj => {
-        if (fileObj && fileObj.filepath && fs.existsSync(fileObj.filepath)) {
-          fs.unlinkSync(fileObj.filepath);
-          console.log(`🗑️ Cleaned up temp file: ${fileObj.filepath}`);
-        }
-      });
+    // Cleanup temp files if any
+    if (rawFiles) {
+      for (const [name, fileArray] of Object.entries(rawFiles)) {
+        fileArray.forEach(fileObj => {
+          if (fileObj && fileObj.filepath && fs.existsSync(fileObj.filepath)) {
+            fs.unlinkSync(fileObj.filepath);
+            console.log(`🗑️ Cleaned up temp file: ${fileObj.filepath}`);
+          }
+        });
+      }
     }
 
     console.log('✅ Parsing complete. Fields count:', Object.keys(fieldsObj).length, 'Files count:', Object.keys(filesObj).length);  // Debug
@@ -253,6 +262,7 @@ async function deleteOldFileFromDO(fileKey) {
 }
 
 async function setVariantAsDigitalInShopify(shopDomain, accessToken, productId, variantId) {
+  console.log(`🔄 Setting variant ${variantId} as digital for product ${productId} on shop ${shopDomain}`);
   const client = new GraphQLClient(`https://${shopDomain}/admin/api/2025-01/graphql.json`, {
     headers: { "X-Shopify-Access-Token": accessToken, "Content-Type": "application/json" },
   });
@@ -265,27 +275,35 @@ async function setVariantAsDigitalInShopify(shopDomain, accessToken, productId, 
     }
   `;
 
-  const inventoryData = await client.request(getInventoryItemIdQuery, { variantId });
-  const inventoryItemId = inventoryData.productVariant?.inventoryItem?.id;
-  if (!inventoryItemId) throw new Error(`No inventory item found for variant ${variantId}`);
-
-  const updateInventoryMutation = gql`
-    mutation updateInventoryItem($id: ID!, $requiresShipping: Boolean!) {
-      inventoryItemUpdate(id: $id, input: { requiresShipping: $requiresShipping }) {
-        inventoryItem { id requiresShipping }
-        userErrors { field message }
-      }
+  try {
+    const inventoryData = await client.request(getInventoryItemIdQuery, { variantId });
+    const inventoryItemId = inventoryData.productVariant?.inventoryItem?.id;
+    if (!inventoryItemId) {
+      console.warn(`⚠️ No inventory item found for variant ${variantId}`);
+      return { status: false, error: `No inventory item found for variant ${variantId}` };
     }
-  `;
 
-  const result = await client.request(updateInventoryMutation, { id: inventoryItemId, requiresShipping: false });
-  if (result.inventoryItemUpdate.userErrors?.length) {
-    console.error("Shopify update errors:", result.inventoryItemUpdate.userErrors);
-    return { status: false, errors: result.inventoryItemUpdate.userErrors };
+    const updateInventoryMutation = gql`
+      mutation updateInventoryItem($id: ID!, $requiresShipping: Boolean!) {
+        inventoryItemUpdate(id: $id, input: { requiresShipping: $requiresShipping }) {
+          inventoryItem { id requiresShipping }
+          userErrors { field message }
+        }
+      }
+    `;
+
+    const result = await client.request(updateInventoryMutation, { id: inventoryItemId, requiresShipping: false });
+    if (result.inventoryItemUpdate.userErrors?.length > 0) {
+      console.error("Shopify update errors for variant:", result.inventoryItemUpdate.userErrors);
+      return { status: false, errors: result.inventoryItemUpdate.userErrors };
+    }
+
+    console.log(`✅ Variant ${variantId} set as digital in Shopify`);
+    return { status: true };
+  } catch (error) {
+    console.error(`❌ Error setting variant ${variantId} as digital:`, error.message);
+    return { status: false, error: error.message };
   }
-
-  console.log("Variant set as digital in Shopify");
-  return { status: true };
 }
 
 async function saveDigitalProduct(existingId, data) {
@@ -294,7 +312,11 @@ async function saveDigitalProduct(existingId, data) {
 }
 
 async function updateProductTagsInShopify(shopDomain, accessToken, productId, newTags = []) {
-  if (!newTags.length) return { status: false, message: "No tags to update" };
+  console.log(`🔄 Updating tags for product ${productId} on shop ${shopDomain} with new tags:`, newTags);
+  if (!newTags.length) {
+    console.warn('⚠️ No tags to update');
+    return { status: false, message: "No tags to update" };
+  }
 
   const client = new GraphQLClient(`https://${shopDomain}/admin/api/2025-01/graphql.json`, {
     headers: {
@@ -312,29 +334,36 @@ async function updateProductTagsInShopify(shopDomain, accessToken, productId, ne
     }
   `;
 
-  const productData = await client.request(getTagsQuery, { id: productId });
-  const currentTags = productData?.product?.tags || [];
+  try {
+    const productData = await client.request(getTagsQuery, { id: productId });
+    const currentTags = productData?.product?.tags || [];
+    console.log(`📋 Current tags:`, currentTags);
 
-  const updatedTags = Array.from(new Set([...currentTags, ...newTags]));
+    const updatedTags = Array.from(new Set([...currentTags, ...newTags]));
+    console.log(`📋 Updated tags:`, updatedTags);
 
-  const updateTagsMutation = gql`
-    mutation updateProductTags($id: ID!, $tags: [String!]!) {
-      productUpdate(input: { id: $id, tags: $tags }) {
-        product { id tags }
-        userErrors { field message }
+    const updateTagsMutation = gql`
+      mutation updateProductTags($id: ID!, $tags: [String!]!) {
+        productUpdate(input: { id: $id, tags: $tags }) {
+          product { id tags }
+          userErrors { field message }
+        }
       }
+    `;
+
+    const result = await client.request(updateTagsMutation, { id: productId, tags: updatedTags });
+
+    if (result.productUpdate.userErrors?.length > 0) {
+      console.error("Tag update errors:", result.productUpdate.userErrors);
+      return { status: false, errors: result.productUpdate.userErrors };
     }
-  `;
 
-  const result = await client.request(updateTagsMutation, { id: productId, tags: updatedTags });
-
-  if (result.productUpdate.userErrors?.length) {
-    console.error("Tag update errors:", result.productUpdate.userErrors);
-    return { status: false, errors: result.productUpdate.userErrors };
+    console.log("✅ Product tags updated successfully:", updatedTags);
+    return { status: true, tags: updatedTags };
+  } catch (error) {
+    console.error(`❌ Error updating tags for ${productId}:`, error.message);
+    return { status: false, error: error.message };
   }
-
-  console.log("✅ Product tags updated successfully:", updatedTags);
-  return { status: true, tags: updatedTags };
 }
 
 // NO GLOBAL MIDDLEWARE - Handle everything inside routes
@@ -346,9 +375,14 @@ app.post('/api/upload', async (req, res) => {
   try {
     const { fields, files } = await parseFormData(req);
     const productDataStr = getField(fields, "productData");
+
+    // Enhanced logging for missing productData
     if (!productDataStr) {
-      return res.status(400).json({ error: "Missing productData field" });
+      console.error('❌ MISSING productData field! Full fields received:', Object.keys(fields));
+      return res.status(400).json({ error: "Missing productData field. Ensure frontend appends JSON-stringified productData to FormData." });
     }
+
+    console.log('✅ productData received and parsed. Keys:', Object.keys(JSON.parse(productDataStr)));
     const productData = JSON.parse(productDataStr);
     const id = productData.id;
 
@@ -364,8 +398,12 @@ app.post('/api/upload', async (req, res) => {
     let commonFile = null;
     let variantFileMap = [];
 
+    // Handle files if present (no-file case: these will be null/empty)
     if (files.file && files.file.length > 0) {
       commonFile = files.file.filter(f => f !== null); // Filter failed uploads if any
+      console.log(`📁 Common file(s) uploaded: ${commonFile.length}`);
+    } else {
+      console.log('ℹ️ No common file uploaded - using existing if update');
     }
 
     Object.keys(files).forEach(key => {
@@ -378,9 +416,14 @@ app.post('/api/upload', async (req, res) => {
             file : validFiles
           };
           variantFileMap.push(variantObj);
+          console.log(`📁 Variant file for ${match[1]} uploaded: ${validFiles.length}`);
         }
       }
     });
+
+    if (variantFileMap.length === 0) {
+      console.log('ℹ️ No variant files uploaded - using existing if update');
+    }
 
     let existingProduct = null;
     let newMode = productData.productType === "commonFile" ? "common" : "variant";
@@ -392,7 +435,6 @@ app.post('/api/upload', async (req, res) => {
       if (!existingProduct) throw new Error("Existing product not found");
 
       oldMode = existingProduct.fileType === "commonFile" ? "common" : "variant";
-
       console.log("🔄 Update mode: oldMode:", oldMode, "newMode:", newMode);
     } else {
       // Add mode - no deletes needed
@@ -411,7 +453,7 @@ app.post('/api/upload', async (req, res) => {
       const hasNewFiles = newMode === "common" ? hasNewCommon : hasNewVariants;
 
       if (!hasNewFiles) {
-        console.log(`🔄 Migrating files for mode switch from ${oldMode} to ${newMode}`);
+        console.log(`🔄 Migrating files for mode switch from ${oldMode} to ${newMode} without new uploads`);
         if (newMode === "common" && oldMode === "variant") {
           // Choose first variant with a file as the common file
           let chosenVariant = null;
@@ -426,15 +468,16 @@ app.post('/api/upload', async (req, res) => {
             migratedCommonUrl = chosenVariant.fileUrl;
             migratedCommonName = chosenVariant.fileName;
             migratedCommonSize = chosenVariant.fileSize;
+            console.log('📂 Migrated common file from variant:', chosenVariant.id);
+          } else {
+            console.warn('⚠️ No existing file to migrate for common mode');
           }
         } else if (newMode === "variant" && oldMode === "common") {
           // No special setup needed; handled in loop using existingProduct.variants[0]
+          console.log('📂 Migrating common file to all variants');
         }
       }
     }
-
-    // Since uploads are done during parsing, doFile is now the uploaded metadata
-    const doFile = commonFile || (variantFileMap.length > 0) ? { files: files, type: newMode } : null; // Adjust based on uploaded results
 
     let productObject = {
       name: productData.title,
@@ -462,12 +505,14 @@ app.post('/api/upload', async (req, res) => {
           fileUrl = commonUpload.url;
           fileName = commonUpload.name;
           fileSize = commonUpload.size;
+          console.log(`📁 Using new common file for variant ${v.id}`);
         } else if (migratedCommonKey) {
           // Migrated from variant mode
           fileKey = migratedCommonKey;
           fileUrl = migratedCommonUrl;
           fileName = migratedCommonName;
           fileSize = migratedCommonSize;
+          console.log(`📂 Using migrated common file for variant ${v.id}`);
         } else {
           // No change: use existing (from frontend or DB)
           const oldV = existingProduct?.variants.find(ev => ev.id === v.id) || existingProduct?.variants[0];
@@ -475,6 +520,7 @@ app.post('/api/upload', async (req, res) => {
           fileUrl = v.fileUrl || oldV?.fileUrl || "";
           fileName = v.fileName || oldV?.fileName || "";
           fileSize = v.fileSize || oldV?.fileSize || 0;
+          console.log(`ℹ️ Using existing common file for variant ${v.id}`);
         }
       } else {
         // Per-variant file mode
@@ -486,6 +532,7 @@ app.post('/api/upload', async (req, res) => {
           fileUrl = newUpload.url;
           fileName = newUpload.name;
           fileSize = newUpload.size;
+          console.log(`📁 Using new variant file for ${v.id}`);
         } else if (existingProduct && oldMode === "common" && oldMode !== newMode) {
           // Migrated from common mode
           const oldCommonFile = existingProduct.variants[0];
@@ -493,6 +540,7 @@ app.post('/api/upload', async (req, res) => {
           fileUrl = oldCommonFile?.fileUrl || v.fileUrl || "";
           fileName = oldCommonFile?.fileName || v.fileName || "";
           fileSize = oldCommonFile?.fileSize || v.fileSize || 0;
+          console.log(`📂 Using migrated variant file (from common) for ${v.id}`);
         } else {
           // No change: use existing (from frontend or DB)
           const oldV = existingProduct?.variants?.find(ev => ev.id === v.id);
@@ -500,6 +548,7 @@ app.post('/api/upload', async (req, res) => {
           fileUrl = v.fileUrl || oldV?.fileUrl || "";
           fileName = v.fileName || oldV?.fileName || "";
           fileSize = v.fileSize || oldV?.fileSize || 0;
+          console.log(`ℹ️ Using existing variant file for ${v.id}`);
         }
       }
 
@@ -520,6 +569,8 @@ app.post('/api/upload', async (req, res) => {
     const productDataSave = await saveDigitalProduct(productData.id, productObject);
     if (!productDataSave) throw new Error("Failed to save digital product in mongo");
 
+    console.log(`💾 Product saved/updated in Mongo: ${productDataSave._id}`);
+
     // Clean up unused old files (global: delete only if not referenced in new product)
     if (existingProduct) {
       const newFileKeys = new Set(productObject.variants.map(v => v.fileKey).filter(k => k));
@@ -529,19 +580,33 @@ app.post('/api/upload', async (req, res) => {
       await Promise.all(toDelete.map(key => deleteOldFileFromDO(key)));
     }
 
+    // Shopify Integration - Always attempt if session exists
     const shop = process.env.SHOP_DOMAIN;
     const shopSession = await ShopifySession.findOne({ shop });
     if (shopSession) {
+      console.log(`🔗 Found Shopify session for ${shop}`);
       try {
+        // Set variants as digital
+        let digitalSuccessCount = 0;
         for (let i = 0; i < productData.variants.length; i++) {
-          await setVariantAsDigitalInShopify(shop, shopSession.accessToken, productData.productId, productData.variants[i].id);
+          const result = await setVariantAsDigitalInShopify(shopSession.shop, shopSession.accessToken, productData.productId, productData.variants[i].id);
+          if (result.status) digitalSuccessCount++;
         }
+        console.log(`✅ ${digitalSuccessCount}/${productData.variants.length} variants set as digital`);
 
+        // Update tags
         const newTags = ["Digital Product"];
-        await updateProductTagsInShopify(shopSession.shop, shopSession.accessToken, productData.productId, newTags);
+        const tagResult = await updateProductTagsInShopify(shopSession.shop, shopSession.accessToken, productData.productId, newTags);
+        if (tagResult.status) {
+          console.log('✅ Tags updated successfully');
+        } else {
+          console.error('❌ Tags update failed:', tagResult);
+        }
       } catch (error) {
-        console.warn("Shopify update failed :", error.message || error);
+        console.warn("Shopify integration failed :", error.message || error);
       }
+    } else {
+      console.warn(`⚠️ No Shopify session found for ${shop} - skipping Shopify updates`);
     }
 
     const isUpdate = !!productData.id;
