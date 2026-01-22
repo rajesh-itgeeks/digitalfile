@@ -450,7 +450,7 @@ app.post('/api/upload', async (req, res) => {
     }
 
     let existingProduct = null;
-    let newMode = productData.fileType === "commonFile" ? "common" : "variant";
+    let newMode = productData.productType === "commonFile" ? "common" : "variant";
     let oldMode = null;
 
     if (productData.id) {
@@ -509,7 +509,7 @@ app.post('/api/upload', async (req, res) => {
       productImage: productData.productImage,
       status: productData.status,
       variants: [],
-      fileType: productData.fileType === "commonFile" ? "common" : "variant",
+      fileType: productData.productType === "commonFile" ? "common" : "variant",
       totalVariants: productData.totalVariants
     };
 
@@ -520,7 +520,7 @@ app.post('/api/upload', async (req, res) => {
       let fileName = v.fileName || "";
       let fileSize = v.fileSize || 0;
 
-      if (productData.fileType === "commonFile") {
+      if (productData.productType === "commonFile") {
         // Common file mode
         if (commonFile && commonFile.length > 0) {
           // New common file upload
