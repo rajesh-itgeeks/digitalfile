@@ -1,11 +1,3 @@
-// server.js - Full Working Single Node.js File for Digital Product Uploader
-// All fixes applied: formidable v3, parsing, S3 upload, Mongo save, Shopify integration
-// Fixes: Updated Shopify API version to 2024-10 (latest stable), added product existence check before tag update,
-//        improved error handling for missing inventory items (skip if already digital/no inventory)
-// Enhanced logging for debugging: productData, tags, no-file uploads
-// Run with: node server.js (or nodemon server.js for dev)
-// Dependencies: npm install express formidable@^3.5.1 aws-sdk graphql-request mongoose dotenv
-
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -20,7 +12,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(cors({
-  origin: '*',                 // dev ke liye OK
+  origin: '*', 
   methods: ['GET','POST','PUT','DELETE','OPTIONS'],
   allowedHeaders: ['Content-Type','Authorization'],
 }));
@@ -458,7 +450,7 @@ app.post('/api/upload', async (req, res) => {
     }
 
     let existingProduct = null;
-    let newMode = productData.productType === "commonFile" ? "common" : "variant";
+    let newMode = productData.fileType === "commonFile" ? "common" : "variant";
     let oldMode = null;
 
     if (productData.id) {
@@ -517,7 +509,7 @@ app.post('/api/upload', async (req, res) => {
       productImage: productData.productImage,
       status: productData.status,
       variants: [],
-      fileType: productData.productType === "commonFile" ? "common" : "variant",
+      fileType: productData.fileType === "commonFile" ? "common" : "variant",
       totalVariants: productData.totalVariants
     };
 
@@ -528,7 +520,7 @@ app.post('/api/upload', async (req, res) => {
       let fileName = v.fileName || "";
       let fileSize = v.fileSize || 0;
 
-      if (productData.productType === "commonFile") {
+      if (productData.fileType === "commonFile") {
         // Common file mode
         if (commonFile && commonFile.length > 0) {
           // New common file upload
