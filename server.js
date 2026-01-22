@@ -1,5 +1,7 @@
 // server.js - Full Working Single Node.js File for Digital Product Uploader
 // All fixes applied: formidable v3, parsing, S3 upload, Mongo save, Shopify integration
+// Fixes: Updated Shopify API version to 2024-10 (latest stable), added product existence check before tag update,
+//        improved error handling for missing inventory items (skip if already digital/no inventory)
 // Enhanced logging for debugging: productData, tags, no-file uploads
 // Run with: node server.js (or nodemon server.js for dev)
 // Dependencies: npm install express formidable@^3.5.1 aws-sdk graphql-request mongoose dotenv
@@ -261,26 +263,42 @@ async function deleteOldFileFromDO(fileKey) {
   }
 }
 
-async function setVariantAsDigitalInShopify(shopDomain, accessToken, productId, variantId) {
-  console.log(`🔄 Setting variant ${variantId} as digital for product ${productId} on shop ${shopDomain}`);
-  const client = new GraphQLClient(`https://${shopDomain}/admin/api/2025-01/graphql.json`, {
-    headers: { "X-Shopify-Access-Token": accessToken, "Content-Type": "application/json" },
-  });
+async function updateVariantShippingInShopify(shopDomain, accessToken, productId, variantId, requiresShipping) {
+  const action = requiresShipping ? 'physical (shipping on)' : 'digital (shipping off)';
+  console.log(`🔄 Setting variant ${variantId} as ${action} for product ${productId} on shop ${shopDomain}`);
+  const client = new GraphQLClient(`https://${shopDomain}/admin/api/2024-10/graphql.json`,
+    {
+      headers: { "X-Shopify-Access-Token": accessToken, "Content-Type": "application/json" },
+    }
+  );
 
   const getInventoryItemIdQuery = gql`
     query getVariantInventory($variantId: ID!) {
       productVariant(id: $variantId) {
-        inventoryItem { id }
+        id
+        inventoryItem { id requiresShipping }
       }
     }
   `;
 
   try {
     const inventoryData = await client.request(getInventoryItemIdQuery, { variantId });
-    const inventoryItemId = inventoryData.productVariant?.inventoryItem?.id;
-    if (!inventoryItemId) {
-      console.warn(`⚠️ No inventory item found for variant ${variantId}`);
-      return { status: false, error: `No inventory item found for variant ${variantId}` };
+    const variant = inventoryData.productVariant;
+    if (!variant) {
+      console.warn(`⚠️ Variant not found: ${variantId}`);
+      return { status: false, error: `Variant not found: ${variantId}` };
+    }
+
+    const inventoryItem = variant.inventoryItem;
+    if (!inventoryItem || !inventoryItem.id) {
+      console.warn(`⚠️ No inventory item found for variant ${variantId} (may already be ${action} or no inventory tracking)`);
+      return { status: false, error: `No inventory item for variant ${variantId}` };
+    }
+
+    // If already matches the target, skip update
+    if (inventoryItem.requiresShipping === requiresShipping) {
+      console.log(`✅ Variant ${variantId} already set as ${action} (requiresShipping: ${requiresShipping})`);
+      return { status: true };
     }
 
     const updateInventoryMutation = gql`
@@ -292,16 +310,16 @@ async function setVariantAsDigitalInShopify(shopDomain, accessToken, productId, 
       }
     `;
 
-    const result = await client.request(updateInventoryMutation, { id: inventoryItemId, requiresShipping: false });
+    const result = await client.request(updateInventoryMutation, { id: inventoryItem.id, requiresShipping });
     if (result.inventoryItemUpdate.userErrors?.length > 0) {
       console.error("Shopify update errors for variant:", result.inventoryItemUpdate.userErrors);
       return { status: false, errors: result.inventoryItemUpdate.userErrors };
     }
 
-    console.log(`✅ Variant ${variantId} set as digital in Shopify`);
+    console.log(`✅ Variant ${variantId} set as ${action} in Shopify`);
     return { status: true };
   } catch (error) {
-    console.error(`❌ Error setting variant ${variantId} as digital:`, error.message);
+    console.error(`❌ Error setting variant ${variantId} as ${action}:`, error.message);
     return { status: false, error: error.message };
   }
 }
@@ -318,29 +336,43 @@ async function updateProductTagsInShopify(shopDomain, accessToken, productId, ne
     return { status: false, message: "No tags to update" };
   }
 
-  const client = new GraphQLClient(`https://${shopDomain}/admin/api/2025-01/graphql.json`, {
+  const client = new GraphQLClient(`https://${shopDomain}/admin/api/2024-10/graphql.json`, {  // Fixed: Use 2024-10
     headers: {
       "X-Shopify-Access-Token": accessToken,
       "Content-Type": "application/json",
     },
   });
 
-  const getTagsQuery = gql`
-    query getProductTags($id: ID!) {
+  // First, check if product exists
+  const checkProductQuery = gql`
+    query checkProduct($id: ID!) {
       product(id: $id) {
         id
+        title
         tags
       }
     }
   `;
 
   try {
-    const productData = await client.request(getTagsQuery, { id: productId });
-    const currentTags = productData?.product?.tags || [];
-    console.log(`📋 Current tags:`, currentTags);
+    const productCheck = await client.request(checkProductQuery, { id: productId });
+    const product = productCheck?.product;
+    if (!product) {
+      console.error(`❌ Product not found: ${productId}`);
+      return { status: false, error: `Product not found: ${productId}` };
+    }
 
+    console.log(`📋 Product found: ${product.title}, Current tags:`, product.tags || []);
+
+    const currentTags = product.tags || [];
     const updatedTags = Array.from(new Set([...currentTags, ...newTags]));
     console.log(`📋 Updated tags:`, updatedTags);
+
+    // If no change, skip update
+    if (updatedTags.length === currentTags.length && updatedTags.every(tag => currentTags.includes(tag))) {
+      console.log('ℹ️ No tag changes needed');
+      return { status: true, tags: updatedTags };
+    }
 
     const updateTagsMutation = gql`
       mutation updateProductTags($id: ID!, $tags: [String!]!) {
@@ -485,7 +517,7 @@ app.post('/api/upload', async (req, res) => {
       productImage: productData.productImage,
       status: productData.status,
       variants: [],
-      fileType: productData.productType,
+      fileType: productData.productType === "commonFile" ? "common" : "variant",
       totalVariants: productData.totalVariants
     };
 
@@ -586,10 +618,23 @@ app.post('/api/upload', async (req, res) => {
     if (shopSession) {
       console.log(`🔗 Found Shopify session for ${shop}`);
       try {
-        // Set variants as digital
+        // Handle removed variants: Set shipping to true (physical)
+        if (existingProduct && productData.id) {
+          const newVariantIds = new Set(productObject.variants.map(v => v.id));
+          const removedVariants = existingProduct.variants.filter(ev => !newVariantIds.has(ev.id));
+          console.log(`🔄 Detected ${removedVariants.length} removed variants`);
+          let revertSuccessCount = 0;
+          for (const removedVariant of removedVariants) {
+            const result = await updateVariantShippingInShopify(shopSession.shop, shopSession.accessToken, productData.productId, removedVariant.id, true);
+            if (result.status) revertSuccessCount++;
+          }
+          console.log(`✅ ${revertSuccessCount}/${removedVariants.length} removed variants set as physical (shipping on)`);
+        }
+
+        // Set remaining variants as digital (shipping off)
         let digitalSuccessCount = 0;
         for (let i = 0; i < productData.variants.length; i++) {
-          const result = await setVariantAsDigitalInShopify(shopSession.shop, shopSession.accessToken, productData.productId, productData.variants[i].id);
+          const result = await updateVariantShippingInShopify(shopSession.shop, shopSession.accessToken, productData.productId, productData.variants[i].id, false);
           if (result.status) digitalSuccessCount++;
         }
         console.log(`✅ ${digitalSuccessCount}/${productData.variants.length} variants set as digital`);
