@@ -450,7 +450,9 @@ app.post('/api/upload', async (req, res) => {
     }
 
     let existingProduct = null;
-    let newMode = productData.productType === "commonFile" ? "common" : "variant";
+    // Special handling for single variant: Always treat as common mode
+    const isSingleVariant = productData.totalVariants <= 1;
+    let newMode = isSingleVariant ? "common" : (productData.fileType === "commonFile" ? "common" : "variant");
     let oldMode = null;
 
     if (productData.id) {
@@ -458,11 +460,18 @@ app.post('/api/upload', async (req, res) => {
       existingProduct = await DigitalProduct.findById(productData.id);
       if (!existingProduct) throw new Error("Existing product not found");
 
-      oldMode = existingProduct.fileType === "commonFile" ? "common" : "variant";
-      console.log("🔄 Update mode: oldMode:", oldMode, "newMode:", newMode);
+      oldMode = existingProduct.fileType === "common" ? "common" : "variant";
+      console.log("🔄 Update mode: oldMode:", oldMode, "newMode:", newMode, "(Single variant override:", isSingleVariant, ")");
     } else {
       // Add mode - no deletes needed
       console.log("➕ Add mode: Creating new digital product");
+    }
+
+    // For single variant: If file came as variantFiles, move it to commonFile
+    if (isSingleVariant && variantFileMap.length > 0 && commonFile.length === 0) {
+      console.log("🔄 Single variant: Moving variant file to common file handling");
+      commonFile = variantFileMap[0]?.file || [];
+      variantFileMap = []; // Clear variant map
     }
 
     // Handle mode switch migration if no new files
@@ -509,7 +518,7 @@ app.post('/api/upload', async (req, res) => {
       productImage: productData.productImage,
       status: productData.status,
       variants: [],
-      fileType: productData.productType === "commonFile" ? "common" : "variant",
+      fileType: newMode === "common" ? "common" : "variant", // Use normalized newMode
       totalVariants: productData.totalVariants
     };
 
@@ -520,7 +529,8 @@ app.post('/api/upload', async (req, res) => {
       let fileName = v.fileName || "";
       let fileSize = v.fileSize || 0;
 
-      if (productData.productType === "commonFile") {
+      const isCommonMode = newMode === "common"; // Use normalized mode
+      if (isCommonMode) {
         // Common file mode
         if (commonFile && commonFile.length > 0) {
           // New common file upload
