@@ -252,55 +252,6 @@ async function deleteOldFileFromDO(fileKey) {
   }
 }
 
-async function handleRemovedVariantDeletes(existingProduct, newVariants) {
-  if (!existingProduct || !newVariants) return;
-
-  const newVariantIds = new Set(newVariants.map(v => v.id));
-  const removedVariants = existingProduct.variants.filter(oldV => !newVariantIds.has(oldV.id));
-
-  console.log(`Found ${removedVariants.length} removed variants to clean up files for.`);
-  for (const removedV of removedVariants) {
-    if (removedV.fileKey) {
-      await deleteOldFileFromDO(removedV.fileKey);
-      console.log(`Deleted file for removed variant: ${removedV.id}`);
-    }
-  }
-}
-
-async function handleModeAndUploadDeletes(existingProduct, newMode, commonFile, variantFileMap) {
-  if (!existingProduct) return;
-
-  let oldMode = null;
-  if (existingProduct.variants?.length > 0) {
-    const firstKey = existingProduct.variants[0]?.fileKey;
-    const allSame = existingProduct.variants.every(v => v.fileKey === firstKey);
-    oldMode = allSame && firstKey ? "common" : "variant";
-  }
-
-  const oldKeys = new Set();
-  existingProduct.variants.forEach(v => {
-    if (v.fileKey) oldKeys.add(v.fileKey);
-  });
-
-  if (oldMode && oldMode !== newMode) {
-    console.log("Switching file modes, deleting old files...");
-    await Promise.all(Array.from(oldKeys).map(key => deleteOldFileFromDO(key)));
-  } else if (oldMode === "common" && newMode === "common" && commonFile && commonFile.length > 0) {
-    const oldKey = existingProduct.variants[0]?.fileKey;
-    if (oldKey) {
-      await deleteOldFileFromDO(oldKey);
-    }
-  } else if (oldMode === "variant" && newMode === "variant") {
-    console.log("Same variant mode, deleting old files for updated variants...");
-    for (const variant of variantFileMap) {
-      const oldVariant = existingProduct.variants.find(v => v.id === variant.id);
-      if (oldVariant?.fileKey) {
-        await deleteOldFileFromDO(oldVariant.fileKey);
-      }
-    }
-  }
-}
-
 async function setVariantAsDigitalInShopify(shopDomain, accessToken, productId, variantId) {
   const client = new GraphQLClient(`https://${shopDomain}/admin/api/2025-01/graphql.json`, {
     headers: { "X-Shopify-Access-Token": accessToken, "Content-Type": "application/json" },
@@ -433,19 +384,53 @@ app.post('/api/upload', async (req, res) => {
 
     let existingProduct = null;
     let newMode = productData.productType === "commonFile" ? "common" : "variant";
+    let oldMode = null;
 
     if (productData.id) {
       // Update mode
       existingProduct = await DigitalProduct.findById(productData.id);
       if (!existingProduct) throw new Error("Existing product not found");
 
-      await handleRemovedVariantDeletes(existingProduct, productData.variants);
+      oldMode = existingProduct.fileType === "commonFile" ? "common" : "variant";
 
-      await handleModeAndUploadDeletes(existingProduct, newMode, commonFile, variantFileMap);
-      console.log("🔄 Update mode: Handled deletes for existing product");
+      console.log("🔄 Update mode: oldMode:", oldMode, "newMode:", newMode);
     } else {
       // Add mode - no deletes needed
       console.log("➕ Add mode: Creating new digital product");
+    }
+
+    // Handle mode switch migration if no new files
+    let migratedCommonKey = null;
+    let migratedCommonUrl = null;
+    let migratedCommonName = null;
+    let migratedCommonSize = null;
+
+    if (existingProduct && oldMode && oldMode !== newMode) {
+      const hasNewCommon = commonFile && commonFile.length > 0;
+      const hasNewVariants = variantFileMap.some(vm => vm.file && vm.file.length > 0);
+      const hasNewFiles = newMode === "common" ? hasNewCommon : hasNewVariants;
+
+      if (!hasNewFiles) {
+        console.log(`🔄 Migrating files for mode switch from ${oldMode} to ${newMode}`);
+        if (newMode === "common" && oldMode === "variant") {
+          // Choose first variant with a file as the common file
+          let chosenVariant = null;
+          for (const ev of existingProduct.variants) {
+            if (ev.fileKey) {
+              chosenVariant = ev;
+              break;
+            }
+          }
+          if (chosenVariant) {
+            migratedCommonKey = chosenVariant.fileKey;
+            migratedCommonUrl = chosenVariant.fileUrl;
+            migratedCommonName = chosenVariant.fileName;
+            migratedCommonSize = chosenVariant.fileSize;
+          }
+        } else if (newMode === "variant" && oldMode === "common") {
+          // No special setup needed; handled in loop using existingProduct.variants[0]
+        }
+      }
     }
 
     // Since uploads are done during parsing, doFile is now the uploaded metadata
@@ -463,35 +448,58 @@ app.post('/api/upload', async (req, res) => {
 
     for (let i = 0; i < productData.variants.length; i++) {
       const v = productData.variants[i];
-      let fileKey, fileUrl, fileName, fileSize;
+      let fileKey = v.fileKey || "";
+      let fileUrl = v.fileUrl || "";
+      let fileName = v.fileName || "";
+      let fileSize = v.fileSize || 0;
 
       if (productData.productType === "commonFile") {
-        if (doFile && doFile.type === "common" && commonFile && commonFile.length > 0) {
-          const commonUpload = commonFile[0]; // Adjust to match uploaded metadata
+        // Common file mode
+        if (commonFile && commonFile.length > 0) {
+          // New common file upload
+          const commonUpload = commonFile[0];
           fileKey = commonUpload.key;
           fileUrl = commonUpload.url;
           fileName = commonUpload.name;
           fileSize = commonUpload.size;
+        } else if (migratedCommonKey) {
+          // Migrated from variant mode
+          fileKey = migratedCommonKey;
+          fileUrl = migratedCommonUrl;
+          fileName = migratedCommonName;
+          fileSize = migratedCommonSize;
         } else {
-          fileKey = v.fileKey || "";
-          fileUrl = v.fileUrl || "";
-          fileName = v.fileName || "";
-          fileSize = v.fileSize || 0;
+          // No change: use existing (from frontend or DB)
+          const oldV = existingProduct?.variants.find(ev => ev.id === v.id) || existingProduct?.variants[0];
+          fileKey = v.fileKey || oldV?.fileKey || "";
+          fileUrl = v.fileUrl || oldV?.fileUrl || "";
+          fileName = v.fileName || oldV?.fileName || "";
+          fileSize = v.fileSize || oldV?.fileSize || 0;
         }
       } else {
-        // For variant mode, lookup from variantFileMap
+        // Per-variant file mode
         const variantUploadObj = variantFileMap.find(vm => vm.id === v.id);
         if (variantUploadObj && variantUploadObj.file && variantUploadObj.file.length > 0) {
+          // New variant file upload
           const newUpload = variantUploadObj.file[0];
           fileKey = newUpload.key;
           fileUrl = newUpload.url;
           fileName = newUpload.name;
           fileSize = newUpload.size;
+        } else if (existingProduct && oldMode === "common" && oldMode !== newMode) {
+          // Migrated from common mode
+          const oldCommonFile = existingProduct.variants[0];
+          fileKey = oldCommonFile?.fileKey || v.fileKey || "";
+          fileUrl = oldCommonFile?.fileUrl || v.fileUrl || "";
+          fileName = oldCommonFile?.fileName || v.fileName || "";
+          fileSize = oldCommonFile?.fileSize || v.fileSize || 0;
         } else {
-          fileKey = v.fileKey || "";
-          fileUrl = v.fileUrl || "";
-          fileName = v.fileName || "";
-          fileSize = v.fileSize || 0;
+          // No change: use existing (from frontend or DB)
+          const oldV = existingProduct?.variants?.find(ev => ev.id === v.id);
+          fileKey = v.fileKey || oldV?.fileKey || "";
+          fileUrl = v.fileUrl || oldV?.fileUrl || "";
+          fileName = v.fileName || oldV?.fileName || "";
+          fileSize = v.fileSize || oldV?.fileSize || 0;
         }
       }
 
@@ -511,6 +519,15 @@ app.post('/api/upload', async (req, res) => {
 
     const productDataSave = await saveDigitalProduct(productData.id, productObject);
     if (!productDataSave) throw new Error("Failed to save digital product in mongo");
+
+    // Clean up unused old files (global: delete only if not referenced in new product)
+    if (existingProduct) {
+      const newFileKeys = new Set(productObject.variants.map(v => v.fileKey).filter(k => k));
+      const oldFileKeys = new Set(existingProduct.variants.map(v => v.fileKey).filter(k => k));
+      const toDelete = [...oldFileKeys].filter(key => !newFileKeys.has(key));
+      console.log(`🗑️ Deleting ${toDelete.length} unused old files`);
+      await Promise.all(toDelete.map(key => deleteOldFileFromDO(key)));
+    }
 
     const shop = process.env.SHOP_DOMAIN;
     const shopSession = await ShopifySession.findOne({ shop });
